@@ -11,16 +11,10 @@
  * Copyright (C) 2017 Potix Corporation. All Rights Reserved.
  */
 import 'dart:async';
-
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:socket_io_common/src/engine/parser/wtf8.dart';
-
-// Protocol version
-final protocol = 3;
-
-enum PacketType { OPEN, CLOSE, PING, PONG, MESSAGE, UPGRADE, NOOP }
+import 'package:old_socket_io_common/src/engine/parser/wtf8.dart';
 
 const List<String?> PacketTypeList = const <String?>[
   'open',
@@ -42,88 +36,22 @@ const Map<String, int> PacketTypeMap = const <String, int>{
   'noop': 6
 };
 
+// Protocol version
+final protocol = 3;
+
 class PacketParser {
   static const ERROR = const {'type': 'error', 'data': 'parser error'};
-  static String? encodePacket(Map packet,
-      {dynamic supportsBinary,
-      utf8encode = false,
-      required callback(_),
-      bool fromClient = false}) {
-    if (supportsBinary is Function) {
-      callback = supportsBinary as dynamic Function(dynamic);
-      supportsBinary = null;
-    }
-
-    if (utf8encode is Function) {
-      callback = utf8encode as dynamic Function(dynamic);
-      utf8encode = null;
-    }
-
-    if (packet['data'] != null) {
-      if (packet['data'] is Uint8List) {
-        return encodeBuffer(packet, supportsBinary, callback,
-            fromClient: fromClient);
-      } else if (packet['data'] is Map &&
-          (packet['data']['buffer'] != null &&
-              packet['data']['buffer'] is ByteBuffer)) {
-        packet['data'] = (packet['data']['buffer'] as ByteBuffer).asUint8List();
-        return encodeBuffer(packet, supportsBinary, callback,
-            fromClient: fromClient);
-      } else if (packet['data'] is ByteBuffer) {
-        packet['data'] = (packet['data'] as ByteBuffer).asUint8List();
-        return encodeBuffer(packet, supportsBinary, callback,
-            fromClient: fromClient);
+  static decodeBase64Packet(String msg, String binaryType) {
+    var type = PacketTypeList[msg.codeUnitAt(0)];
+    var data = base64.decode(utf8.decode(msg.substring(1).codeUnits));
+    if (binaryType == 'arraybuffer') {
+      var abv = new Uint8List(data.length);
+      for (var i = 0; i < abv.length; i++) {
+        abv[i] = data[i];
       }
+      return {'type': type, 'data': abv.buffer};
     }
-
-    // Sending data as a utf-8 string
-    var encoded = '''${PacketTypeMap[packet['type']]}''';
-
-    // data fragment is optional
-    if (packet['data'] != null) {
-      encoded += utf8encode == true
-          ? WTF8.encode('''${packet['data']}''')
-          : '''${packet['data']}''';
-    }
-
-    return callback('$encoded');
-  }
-
-  /**
-   * Encode Buffer data
-   */
-
-  static encodeBuffer(packet, supportsBinary, callback,
-      {fromClient = false /*use this to check whether is in client or not*/}) {
-    if (!supportsBinary) {
-      return encodeBase64Packet(packet, callback);
-    }
-
-    var data = packet['data'];
-    // 'fromClient' is to check if the runtime is on server side or not,
-    // because Dart server's websocket cannot send data with byte buffer.
-    final newData = new Uint8List(data.length + 1);
-    newData
-      ..setAll(0, [PacketTypeMap[packet['type']]!]..length = 1)
-      ..setAll(1, data);
-    if (fromClient) {
-      return callback(newData.buffer);
-    } else {
-      return callback(newData);
-    }
-  }
-
-  /**
-   * Encodes a packet with binary data in a base64 string
-   *
-   * @param {Object} packet, has `type` and `data`
-   * @return {String} base64 encoded message
-   */
-
-  static encodeBase64Packet(packet, callback) {
-    var message = '''b${PacketTypeMap[packet['type']]}''';
-    message += base64.encode(packet.data.toString().codeUnits);
-    return callback(message);
+    return {'type': type, 'data': data};
   }
 
   static decodePacket(dynamic data, {binaryType, required bool utf8decode}) {
@@ -171,65 +99,7 @@ class PacketParser {
     return {'type': PacketTypeList[type], 'data': data.sublist(1)};
   }
 
-  static decodeBase64Packet(String msg, String binaryType) {
-    var type = PacketTypeList[msg.codeUnitAt(0)];
-    var data = base64.decode(utf8.decode(msg.substring(1).codeUnits));
-    if (binaryType == 'arraybuffer') {
-      var abv = new Uint8List(data.length);
-      for (var i = 0; i < abv.length; i++) {
-        abv[i] = data[i];
-      }
-      return {'type': type, 'data': abv.buffer};
-    }
-    return {'type': type, 'data': data};
-  }
-
-  static hasBinary(List packets) {
-    return packets.any((map) {
-      final data = map['data'];
-      return data != null && data is ByteBuffer;
-    });
-  }
-
-  static encodePayload(List packets,
-      {bool supportsBinary = false, required callback(_)}) {
-    if (supportsBinary && hasBinary(packets)) {
-      return encodePayloadAsBinary(packets, callback);
-    }
-
-    if (packets.isEmpty) {
-      return callback('0:');
-    }
-
-    var encodeOne = (packet, doneCallback(_)) {
-      encodePacket(packet, supportsBinary: supportsBinary, utf8encode: false,
-          callback: (message) {
-        doneCallback(_setLengthHeader(message));
-      });
-    };
-
-    map(packets, encodeOne, (results) {
-      return callback(results.join(''));
-    });
-  }
-
-  static _setLengthHeader(message) {
-    return '${message.length}:$message';
-  }
-
-  /**
-   * Async array map using after
-   */
-  static map(List ary, each(_, callback(msg)), done(results)) {
-    var result = [];
-    Future.wait(ary.map((e) {
-      return new Future.microtask(() => each(e, (msg) {
-            result.add(msg);
-          }));
-    })).then((r) => done(result));
-  }
-
-/*
+  /*
  * Decodes data when a payload is maybe expected. Possible binary contents are
  * decoded from their base64 representation
  *
@@ -331,16 +201,41 @@ class PacketParser {
     }
   }
 
-  static encodePayloadAsBinary(List packets, callback(_)) {
-    if (packets.isEmpty) {
-      return callback(new Uint8List(0));
+  /**
+   * Encodes a packet with binary data in a base64 string
+   *
+   * @param {Object} packet, has `type` and `data`
+   * @return {String} base64 encoded message
+   */
+
+  static encodeBase64Packet(packet, callback) {
+    var message = '''b${PacketTypeMap[packet['type']]}''';
+    message += base64.encode(packet.data.toString().codeUnits);
+    return callback(message);
+  }
+
+  /**
+   * Encode Buffer data
+   */
+
+  static encodeBuffer(packet, supportsBinary, callback,
+      {fromClient = false /*use this to check whether is in client or not*/}) {
+    if (!supportsBinary) {
+      return encodeBase64Packet(packet, callback);
     }
 
-    map(packets, encodeOneBinaryPacket, (results) {
-      var list = [];
-      results.forEach((e) => list.addAll(e));
-      return callback(list);
-    });
+    var data = packet['data'];
+    // 'fromClient' is to check if the runtime is on server side or not,
+    // because Dart server's websocket cannot send data with byte buffer.
+    final newData = new Uint8List(data.length + 1);
+    newData
+      ..setAll(0, [PacketTypeMap[packet['type']]!]..length = 1)
+      ..setAll(1, data);
+    if (fromClient) {
+      return callback(newData.buffer);
+    } else {
+      return callback(newData);
+    }
   }
 
   static encodeOneBinaryPacket(p, doneCallback(dynamic _)) {
@@ -372,6 +267,104 @@ class PacketParser {
         supportsBinary: true, utf8encode: true, callback: onBinaryPacketEncode);
   }
 
+  static String? encodePacket(Map packet,
+      {dynamic supportsBinary,
+      utf8encode = false,
+      required callback(_),
+      bool fromClient = false}) {
+    if (supportsBinary is Function) {
+      callback = supportsBinary as dynamic Function(dynamic);
+      supportsBinary = null;
+    }
+
+    if (utf8encode is Function) {
+      callback = utf8encode as dynamic Function(dynamic);
+      utf8encode = null;
+    }
+
+    if (packet['data'] != null) {
+      if (packet['data'] is Uint8List) {
+        return encodeBuffer(packet, supportsBinary, callback,
+            fromClient: fromClient);
+      } else if (packet['data'] is Map &&
+          (packet['data']['buffer'] != null &&
+              packet['data']['buffer'] is ByteBuffer)) {
+        packet['data'] = (packet['data']['buffer'] as ByteBuffer).asUint8List();
+        return encodeBuffer(packet, supportsBinary, callback,
+            fromClient: fromClient);
+      } else if (packet['data'] is ByteBuffer) {
+        packet['data'] = (packet['data'] as ByteBuffer).asUint8List();
+        return encodeBuffer(packet, supportsBinary, callback,
+            fromClient: fromClient);
+      }
+    }
+
+    // Sending data as a utf-8 string
+    var encoded = '''${PacketTypeMap[packet['type']]}''';
+
+    // data fragment is optional
+    if (packet['data'] != null) {
+      encoded += utf8encode == true
+          ? WTF8.encode('''${packet['data']}''')
+          : '''${packet['data']}''';
+    }
+
+    return callback('$encoded');
+  }
+
+  static encodePayload(List packets,
+      {bool supportsBinary = false, required callback(_)}) {
+    if (supportsBinary && hasBinary(packets)) {
+      return encodePayloadAsBinary(packets, callback);
+    }
+
+    if (packets.isEmpty) {
+      return callback('0:');
+    }
+
+    var encodeOne = (packet, doneCallback(_)) {
+      encodePacket(packet, supportsBinary: supportsBinary, utf8encode: false,
+          callback: (message) {
+        doneCallback(_setLengthHeader(message));
+      });
+    };
+
+    map(packets, encodeOne, (results) {
+      return callback(results.join(''));
+    });
+  }
+
+  static encodePayloadAsBinary(List packets, callback(_)) {
+    if (packets.isEmpty) {
+      return callback(new Uint8List(0));
+    }
+
+    map(packets, encodeOneBinaryPacket, (results) {
+      var list = [];
+      results.forEach((e) => list.addAll(e));
+      return callback(list);
+    });
+  }
+
+  static hasBinary(List packets) {
+    return packets.any((map) {
+      final data = map['data'];
+      return data != null && data is ByteBuffer;
+    });
+  }
+
+  /**
+   * Async array map using after
+   */
+  static map(List ary, each(_, callback(msg)), done(results)) {
+    var result = [];
+    Future.wait(ary.map((e) {
+      return new Future.microtask(() => each(e, (msg) {
+            result.add(msg);
+          }));
+    })).then((r) => done(result));
+  }
+
   static List<int> stringToBuffer(String string) {
     var buf = new Uint8List(string.length);
     for (var i = 0, l = string.length; i < l; i++) {
@@ -379,4 +372,10 @@ class PacketParser {
     }
     return buf;
   }
+
+  static _setLengthHeader(message) {
+    return '${message.length}:$message';
+  }
 }
+
+enum PacketType { OPEN, CLOSE, PING, PONG, MESSAGE, UPGRADE, NOOP }

@@ -12,17 +12,18 @@
  */
 import 'dart:convert';
 import 'dart:typed_data';
-import 'package:logging/logging.dart';
-import 'package:socket_io_common/socket_io_common.dart';
-import 'package:socket_io_common/src/util/event_emitter.dart';
 
+import 'package:logging/logging.dart';
+import 'package:old_socket_io_common/socket_io_common.dart';
+import 'package:old_socket_io_common/src/util/event_emitter.dart';
+
+const int ACK = 3;
+const int BINARY_ACK = 6;
+const int BINARY_EVENT = 5;
 const int CONNECT = 0;
 const int DISCONNECT = 1;
-const int EVENT = 2;
-const int ACK = 3;
 const int ERROR = 4;
-const int BINARY_EVENT = 5;
-const int BINARY_ACK = 6;
+const int EVENT = 2;
 
 /**
  * A socket.io Encoder instance
@@ -40,89 +41,56 @@ List<String?> PacketTypes = <String?>[
   'BINARY_ACK'
 ];
 
-class Encoder {
-  static final Logger _logger = new Logger('socket_io:parser.Encoder');
-
-  /**
-   * Encode a packet as a single string if non-binary, or as a
-   * buffer sequence, depending on packet type.
-   *
-   * @param {Object} obj - packet object
-   * @param {Function} callback - function to handle encodings (likely engine.write)
-   * @return Calls callback with Array of encodings
-   * @api public
-   */
-
-  encode(obj, callback) {
-    _logger.fine('encoding packet $obj');
-
-    if (BINARY_EVENT == obj['type'] || BINARY_ACK == obj['type']) {
-      encodeAsBinary(obj, callback);
-    } else {
-      var encoding = encodeAsString(obj);
-      callback([encoding]);
-    }
-  }
-
-  /**
-   * Encode packet as string.
-   *
-   * @param {Object} packet
-   * @return {String} encoded
-   * @api private
-   */
-
-  static String encodeAsString(obj) {
-    // first is type
-    var str = '${obj['type']}';
-
-    // attachments if we have them
-    if (BINARY_EVENT == obj['type'] || BINARY_ACK == obj['type']) {
-      str += '${obj['attachments']}-';
-    }
-
-    // if we have a namespace other than `/`
-    // we append it followed by a comma `,`
-    if (obj['nsp'] != null && '/' != obj['nsp']) {
-      str += obj['nsp'] + ',';
-    }
-
-    // immediately followed by the id
-    if (null != obj['id']) {
-      str += '${obj['id']}';
-    }
-
-    // json data
-    if (null != obj['data']) {
-      str += json.encode(obj['data']);
-    }
-
-    _logger.fine('encoded $obj as $str');
-    return str;
-  }
+Map error() {
+  return {'type': ERROR, 'data': 'parser error'};
+}
 
 /**
- * Encode packet as 'buffer sequence' by removing blobs, and
- * deconstructing packet into object with placeholders and
- * a list of buffers.
+ * A manager of a binary event's 'buffer sequence'. Should
+ * be constructed whenever a packet of type BINARY_EVENT is
+ * decoded.
  *
  * @param {Object} packet
- * @return {Buffer} encoded
+ * @return {BinaryReconstructor} initialized reconstructor
  * @api private
  */
+class BinaryReconstructor {
+  late Map? reconPack;
+  List buffers = [];
+  BinaryReconstructor(packet) {
+    this.reconPack = packet;
+  }
 
-  static encodeAsBinary(obj, callback) {
-    var writeEncoding = (bloblessData) {
-      var deconstruction = Binary.deconstructPacket(bloblessData);
-      var pack = encodeAsString(deconstruction['packet']);
-      var buffers = deconstruction['buffers'];
+  /** Cleans up binary packet reconstruction variables.
+   *
+   * @api private
+   */
+  void finishedReconstruction() {
+    this.reconPack = null;
+    this.buffers = [];
+  }
 
-      // add packet info to beginning of data list
-      callback(<dynamic>[pack]..addAll(buffers)); // write all the buffers
-    };
-//
-//  binary.removeBlobs(obj, writeEncoding);
-    writeEncoding(obj);
+  /**
+   * Method to be called when binary data received from connection
+   * after a BINARY_EVENT packet.
+   *
+   * @param {Buffer | ArrayBuffer} binData - the raw binary data received
+   * @return {null | Object} returns null if more binary data is expected or
+   *   a reconstructed packet object if all buffers have been received.
+   * @api private
+   */
+  takeBinaryData(binData) {
+    this.buffers.add(binData);
+    if (this.buffers.length == this.reconPack!['attachments']) {
+      // done with buffer list
+
+      var packet = Binary.reconstructPacket(
+          this.reconPack!, this.buffers.cast<List<int>>());
+
+      this.finishedReconstruction();
+      return packet;
+    }
+    return null;
   }
 }
 
@@ -175,6 +143,18 @@ class Decoder extends EventEmitter {
       }
     } else {
       throw new UnsupportedError('Unknown type: ' + obj);
+    }
+  }
+
+  /**
+ * Deallocates a parser's resources
+ *
+ * @api public
+ */
+
+  destroy() {
+    if (this.reconstructor != null) {
+      this.reconstructor.finishedReconstruction();
     }
   }
 
@@ -253,69 +233,90 @@ class Decoder extends EventEmitter {
     }
     return p;
   }
-
-/**
- * Deallocates a parser's resources
- *
- * @api public
- */
-
-  destroy() {
-    if (this.reconstructor != null) {
-      this.reconstructor.finishedReconstruction();
-    }
-  }
 }
 
-/**
- * A manager of a binary event's 'buffer sequence'. Should
- * be constructed whenever a packet of type BINARY_EVENT is
- * decoded.
- *
- * @param {Object} packet
- * @return {BinaryReconstructor} initialized reconstructor
- * @api private
- */
-class BinaryReconstructor {
-  late Map? reconPack;
-  List buffers = [];
-  BinaryReconstructor(packet) {
-    this.reconPack = packet;
+class Encoder {
+  static final Logger _logger = new Logger('socket_io:parser.Encoder');
+
+  /**
+   * Encode a packet as a single string if non-binary, or as a
+   * buffer sequence, depending on packet type.
+   *
+   * @param {Object} obj - packet object
+   * @param {Function} callback - function to handle encodings (likely engine.write)
+   * @return Calls callback with Array of encodings
+   * @api public
+   */
+
+  encode(obj, callback) {
+    _logger.fine('encoding packet $obj');
+
+    if (BINARY_EVENT == obj['type'] || BINARY_ACK == obj['type']) {
+      encodeAsBinary(obj, callback);
+    } else {
+      var encoding = encodeAsString(obj);
+      callback([encoding]);
+    }
   }
 
   /**
-   * Method to be called when binary data received from connection
-   * after a BINARY_EVENT packet.
+ * Encode packet as 'buffer sequence' by removing blobs, and
+ * deconstructing packet into object with placeholders and
+ * a list of buffers.
+ *
+ * @param {Object} packet
+ * @return {Buffer} encoded
+ * @api private
+ */
+
+  static encodeAsBinary(obj, callback) {
+    var writeEncoding = (bloblessData) {
+      var deconstruction = Binary.deconstructPacket(bloblessData);
+      var pack = encodeAsString(deconstruction['packet']);
+      var buffers = deconstruction['buffers'];
+
+      // add packet info to beginning of data list
+      callback(<dynamic>[pack]..addAll(buffers)); // write all the buffers
+    };
+//
+//  binary.removeBlobs(obj, writeEncoding);
+    writeEncoding(obj);
+  }
+
+/**
+   * Encode packet as string.
    *
-   * @param {Buffer | ArrayBuffer} binData - the raw binary data received
-   * @return {null | Object} returns null if more binary data is expected or
-   *   a reconstructed packet object if all buffers have been received.
+   * @param {Object} packet
+   * @return {String} encoded
    * @api private
    */
-  takeBinaryData(binData) {
-    this.buffers.add(binData);
-    if (this.buffers.length == this.reconPack!['attachments']) {
-      // done with buffer list
 
-      var packet = Binary.reconstructPacket(
-          this.reconPack!, this.buffers.cast<List<int>>());
+  static String encodeAsString(obj) {
+    // first is type
+    var str = '${obj['type']}';
 
-      this.finishedReconstruction();
-      return packet;
+    // attachments if we have them
+    if (BINARY_EVENT == obj['type'] || BINARY_ACK == obj['type']) {
+      str += '${obj['attachments']}-';
     }
-    return null;
-  }
 
-  /** Cleans up binary packet reconstruction variables.
-   *
-   * @api private
-   */
-  void finishedReconstruction() {
-    this.reconPack = null;
-    this.buffers = [];
-  }
-}
+    // if we have a namespace other than `/`
+    // we append it followed by a comma `,`
+    if (obj['nsp'] != null && '/' != obj['nsp']) {
+      str += obj['nsp'] + ',';
+    }
 
-Map error() {
-  return {'type': ERROR, 'data': 'parser error'};
+    // immediately followed by the id
+    if (null != obj['id']) {
+      str += '${obj['id']}';
+    }
+
+    // json data
+    if (null != obj['data']) {
+      str += json.encode(obj['data']);
+    }
+
+    _logger.fine('encoded $obj as $str');
+    return str;
+  }
 }
